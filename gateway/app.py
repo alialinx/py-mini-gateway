@@ -4,6 +4,10 @@ from dataclasses import dataclass
 from fastapi import HTTPException,Response
 from typing import Any
 
+from starlette.responses import JSONResponse
+
+from gateway.proxy import UpstreamTimeoutError, UpstreamConnectionError
+
 
 @dataclass
 class RequestContext:
@@ -33,16 +37,15 @@ class GatewayApp:
         self.logger = logger
 
 
-    async def handle(self, request:Any):
-
+    async def handle(self, request: Any):
         ctx = await self._build_context(request)
 
         try:
-            await self._apply_guards( ctx)
+            await self._apply_guards(ctx)
 
             match = self._find_route(ctx)
 
-            self.logger.request_in(ctx, request,match)
+            self.logger.request_in(ctx, request, match)
 
             upstream_resp = await self._forward(ctx, match)
 
@@ -50,15 +53,21 @@ class GatewayApp:
 
             return self._to_response(upstream_resp)
 
+        except HTTPException:
+            raise
+
         except Exception as err:
-            self.logger.request_out(ctx,500, error=str(err))
-            return self._error_response(500, ctx, "internal error", str(err))
-
-
+            self.logger.request_out(ctx, 500, error=str(err))
+            return self._error_response(
+                status_code=500,
+                ctx=ctx,
+                code="internal_error",
+                message=str(err),
+            )
 
     async def _build_context(self, request: Any) -> RequestContext:
         body = await request.body()
-        return RequestContext(request_id=generate_request_id,start_ms=0, client_ip=request.client.host if request.client else "", method=request.method, path=request.url.path, query=request.url.query, body= body,headers = dict(request.headers))
+        return RequestContext(request_id=generate_request_id(),start_ms=0, client_ip=request.client.host if request.client else "", method=request.method, path=request.url.path, query=request.url.query, body= body,headers = dict(request.headers))
 
     async def _apply_guards(self, ctx: RequestContext):
 
@@ -81,21 +90,21 @@ class GatewayApp:
 
     async def _forward(self, ctx: RequestContext, match: Any):
 
-        method = ctx.method
-        headers = ctx.headers
-        body = ctx.body
-        upstream_url = match.upstream_url,
+        try:
+            return await self.proxy.request(ctx=ctx,method=ctx.method,url=match.upstream_url,headers=ctx.headers,body=ctx.body,)
 
-
-        response = await self.proxy.request(ctx, method, upstream_url,headers,body)
-
-        return response
+        except UpstreamTimeoutError:
+            raise HTTPException(status_code=504, detail="upstream timeout")
+        except UpstreamConnectionError:
+            raise HTTPException(status_code=502, detail="bad gateway")
 
 
     def _to_response(self, upstream_resp: Any):
 
         return Response(status_code=upstream_resp.status_code, headers=upstream_resp.headers, content=upstream_resp.body)
 
-    def _error_response(self, status_code, ctx:RequestContext, code:str, message:str):
-        return {"request_id":ctx.request_id, "error": {"code":code, "message":message}}
-
+    def _error_response(self, status_code: int, ctx: RequestContext, code: str, message: str):
+        return JSONResponse(
+            status_code=status_code,
+            content={"request_id": ctx.request_id, "error": {"code": code, "message": message}},
+        )
